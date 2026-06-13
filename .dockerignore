@@ -1,0 +1,6 @@
+# The Dockerfile.test image carries only the toolchain; source is bind-mounted
+# at run time, so nothing here needs to enter the build context.
+target/
+.git/
+.zed/
+docs/

@@ -1,0 +1,7 @@
+/target
+
+# Local editor config (not shared)
+/.zed/
+
+# Local-only design specs & plans (kept out of git per project convention)
+/docs/superpowers/

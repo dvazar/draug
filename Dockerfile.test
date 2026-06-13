@@ -1,0 +1,6 @@
+# Linux build/test image for draug's epoll/signalfd/timerfd code paths.
+FROM rust:1-bookworm
+WORKDIR /app
+ENV CARGO_TARGET_DIR=/tmp/target
+# Source is bind-mounted at run time; this image only carries the toolchain.
+CMD ["cargo", "test", "--all-targets", "--features", "_test_support"]
