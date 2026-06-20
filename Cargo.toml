@@ -1,6 +1,6 @@
 [package]
 name = "draug"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A small, cgroup-aware process supervisor that restarts one target gracefully before the OOM killer does."
 license = "Apache-2.0"
