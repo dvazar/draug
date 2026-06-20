@@ -1,10 +1,9 @@
 //! Alerting — fires only on anomalies (SIGKILL escalation, crash-loop, and
 //! memory/PSI restarts); routine periodic restarts are logged, not alerted.
 //!
-//! Behind an `AlertSink` trait so tests inject a double. Production sinks:
-//!   * webhook — POST a JSON payload to `DRAUG_WEBHOOK_URL`,
-//!   * sentry  — capture an event with the diagnostics snapshot (feature-gated,
-//!     enabled when `SENTRY_DSN` is set).
+//! Behind an `AlertSink` trait so tests inject a double. The production sink is
+//! the webhook — POST a JSON payload to `DRAUG_WEBHOOK_URL`. The trait makes
+//! additional sinks (e.g. a paging integration) a drop-in addition later.
 //!
 //! Network I/O uses a short timeout and is best-effort: a failed or slow alert
 //! must never block the drain/respawn path.

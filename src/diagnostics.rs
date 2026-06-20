@@ -5,7 +5,7 @@
 //! file descriptors, heartbeat age, and the restart counter. Captured while
 //! the target is still alive — at the start of a drain and re-captured just
 //! before a SIGKILL escalation — so the alert carries the state at the moment
-//! of failure (mirrors the old run_scheduler Sentry context). The crash-loop
+//! of failure. The crash-loop
 //! exit is the one unavoidable exception: the target is already gone, so
 //! thread/fd counts are necessarily absent there.
 

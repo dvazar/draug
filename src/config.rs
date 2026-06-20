@@ -6,8 +6,7 @@
 //! --heartbeat-max-age, --startup-grace, --max-failures, --backoff,
 //! --cgroup-root.
 //!
-//! Env: DRAUG_WEBHOOK_URL, SENTRY_DSN, DRAUG_SERVICE,
-//! DRAUG_ENV, DRAUG_HEARTBEAT_FILE.
+//! Env: DRAUG_WEBHOOK_URL, DRAUG_SERVICE, DRAUG_ENV, DRAUG_HEARTBEAT_FILE.
 //!
 //! Triggers are disabled individually: `--restart-interval 0` and
 //! `--mem-threshold 0` turn those off, while `--psi-trigger ""` (empty string,
@@ -149,6 +148,15 @@ pub struct Cli {
     pub backoff: String,
     #[arg(long, default_value = "/sys/fs/cgroup")]
     pub cgroup_root: PathBuf,
+    /// Minimum log level to emit: error|warn|info|debug. Absent -> env
+    /// DRAUG_LOG_LEVEL, then the `info` default.
+    #[arg(long)]
+    pub log_level: Option<String>,
+    /// Prefix each log line with an RFC3339 UTC timestamp. Off by default
+    /// (collectors like CloudWatch/journald add their own); also enabled by a
+    /// truthy DRAUG_LOG_TIMESTAMPS.
+    #[arg(long)]
+    pub log_timestamps: bool,
     /// Target command and its args, following `--`.
     #[arg(last = true)]
     pub target: Vec<String>,
@@ -158,10 +166,11 @@ pub struct Cli {
 #[derive(Debug, Default, Clone)]
 pub struct EnvVars {
     pub webhook_url: Option<String>,
-    pub sentry_dsn: Option<String>,
     pub service: Option<String>,
     pub env: Option<String>,
     pub heartbeat_file: Option<String>,
+    pub log_level: Option<String>,
+    pub log_timestamps: bool,
 }
 
 impl EnvVars {
@@ -170,12 +179,24 @@ impl EnvVars {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         EnvVars {
             webhook_url: get("DRAUG_WEBHOOK_URL"),
-            sentry_dsn: get("SENTRY_DSN"),
             service: get("DRAUG_SERVICE"),
             env: get("DRAUG_ENV"),
             heartbeat_file: get("DRAUG_HEARTBEAT_FILE"),
+            log_level: get("DRAUG_LOG_LEVEL"),
+            log_timestamps: get("DRAUG_LOG_TIMESTAMPS")
+                .as_deref()
+                .map(is_truthy)
+                .unwrap_or(false),
         }
     }
+}
+
+/// Recognize the common truthy spellings for a boolean environment variable.
+fn is_truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Fully resolved runtime configuration.
@@ -195,9 +216,10 @@ pub struct Config {
     pub cgroup_root: PathBuf,
     pub target: Vec<String>,
     pub webhook_url: Option<String>,
-    pub sentry_dsn: Option<String>,
     pub service: Option<String>,
     pub env: Option<String>,
+    pub log_level: crate::log::LogLevel,
+    pub log_timestamps: bool,
 }
 
 impl Config {
@@ -265,6 +287,16 @@ impl Config {
                 "--heartbeat-max-age must be greater than zero when --heartbeat-file is set".into(),
             );
         }
+        // Log level: flag overrides env overrides the `info` default (mirrors
+        // the heartbeat-file precedence). Timestamps are an opt-in toggle, so
+        // EITHER the flag or a truthy env enables them.
+        let log_level: crate::log::LogLevel = cli
+            .log_level
+            .as_deref()
+            .or(env.log_level.as_deref())
+            .unwrap_or("info")
+            .parse()?;
+        let log_timestamps = cli.log_timestamps || env.log_timestamps;
         Ok(Config {
             restart_interval,
             mem_threshold,
@@ -280,9 +312,10 @@ impl Config {
             cgroup_root: cli.cgroup_root,
             target: cli.target,
             webhook_url: env.webhook_url,
-            sentry_dsn: env.sentry_dsn,
             service: env.service,
             env: env.env,
+            log_level,
+            log_timestamps,
         })
     }
 }
@@ -552,5 +585,66 @@ mod config_tests {
         // sanity: the defaults (tick 2s, grace 90s, backoff 5s) still build
         let cli = Cli::try_parse_from(["draug", "--", "x"]).unwrap();
         assert!(Config::build(cli, empty_env()).is_ok());
+    }
+
+    #[test]
+    fn log_level_defaults_to_info() {
+        let cli = Cli::try_parse_from(["draug", "--", "x"]).unwrap();
+        let cfg = Config::build(cli, empty_env()).unwrap();
+        assert_eq!(cfg.log_level, crate::log::LogLevel::Info);
+        assert!(!cfg.log_timestamps);
+    }
+
+    #[test]
+    fn log_level_flag_overrides_env() {
+        let cli = Cli::try_parse_from(["draug", "--log-level", "debug", "--", "x"]).unwrap();
+        let env = EnvVars {
+            log_level: Some("warn".into()),
+            ..Default::default()
+        };
+        let cfg = Config::build(cli, env).unwrap();
+        assert_eq!(cfg.log_level, crate::log::LogLevel::Debug);
+    }
+
+    #[test]
+    fn log_level_from_env_when_flag_absent() {
+        let cli = Cli::try_parse_from(["draug", "--", "x"]).unwrap();
+        let env = EnvVars {
+            log_level: Some("warn".into()),
+            ..Default::default()
+        };
+        let cfg = Config::build(cli, env).unwrap();
+        assert_eq!(cfg.log_level, crate::log::LogLevel::Warn);
+    }
+
+    #[test]
+    fn invalid_log_level_is_error() {
+        let cli = Cli::try_parse_from(["draug", "--log-level", "trace", "--", "x"]).unwrap();
+        assert!(Config::build(cli, empty_env()).is_err());
+    }
+
+    #[test]
+    fn log_timestamps_enabled_by_flag_or_env() {
+        // Flag alone.
+        let cli = Cli::try_parse_from(["draug", "--log-timestamps", "--", "x"]).unwrap();
+        assert!(Config::build(cli, empty_env()).unwrap().log_timestamps);
+
+        // Env alone (truthy).
+        let cli = Cli::try_parse_from(["draug", "--", "x"]).unwrap();
+        let env = EnvVars {
+            log_timestamps: true,
+            ..Default::default()
+        };
+        assert!(Config::build(cli, env).unwrap().log_timestamps);
+    }
+
+    #[test]
+    fn env_truthy_spellings() {
+        for v in ["1", "true", "TRUE", "Yes", "on"] {
+            assert!(is_truthy(v), "{v} should be truthy");
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!is_truthy(v), "{v} should be falsy");
+        }
     }
 }

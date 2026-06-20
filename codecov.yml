@@ -1,0 +1,23 @@
+# Codecov configuration.
+#
+# Coverage is INFORMATIONAL: it updates the badge and posts a PR summary, but it
+# never fails a check. draug's gate is fmt + clippy + the test matrix (see
+# .github/workflows/ci.yml), not a coverage percentage — a red coverage delta
+# should inform a review, not block a merge.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Don't count the integration-test harness as product code; only src/ coverage
+# drives the badge.
+ignore:
+  - "tests/"
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true # only comment when a PR actually moves coverage
