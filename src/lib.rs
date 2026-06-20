@@ -8,7 +8,7 @@
 //!   * a stale heartbeat file.
 //!
 //! Designed to run as a lightweight child of tini:
-//!   tini (PID 1) -> draug -> target (planq / apscheduler / uvicorn / ...)
+//!   tini (PID 1) -> draug -> <command> [args...]
 //!
 //! The supervisor decides *when* to restart and escalates to SIGKILL if the
 //! target hangs; the graceful drain itself lives in the target's own signal
@@ -22,6 +22,7 @@ pub mod decision;
 pub mod diagnostics;
 pub mod fsm;
 pub mod heartbeat;
+pub mod log;
 pub mod psi;
 pub mod supervisor;
 
@@ -45,13 +46,6 @@ pub fn run(config: Config) -> i32 {
             config.service.clone(),
             config.env.clone(),
         )));
-    }
-    #[cfg(feature = "sentry")]
-    {
-        // The Sentry sink (`alert::sentry_sink`) is a planned follow-up and is
-        // not implemented yet. Fail with a clear message instead of a raw
-        // "cannot find function" error when someone flips the feature on.
-        compile_error!("the `sentry` feature is not implemented yet; build without it");
     }
     let sink: Box<dyn alert::AlertSink> = if sinks.is_empty() {
         Box::new(alert::NullSink)

@@ -48,6 +48,7 @@ mod linux {
     use crate::diagnostics::Snapshot;
     use crate::fsm;
     use crate::heartbeat::{HeartbeatAge, heartbeat_age};
+    use crate::log::{LogLevel, Logger};
     use crate::psi::{self, PsiHandle};
     use crate::{alert, cgroup};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
@@ -183,6 +184,9 @@ mod linux {
     }
 
     pub fn run(config: Config, sink: &dyn AlertSink) -> i32 {
+        // 0) Logger: gates every line by `--log-level` and optionally stamps it.
+        let logger = Logger::new(config.log_level, config.log_timestamps);
+
         // 1) Block the signals we will read via signalfd. `lib::run` already
         // blocked this exact set on the main thread before spawning any alert
         // worker (so workers inherit the blocked mask — see
@@ -266,11 +270,11 @@ mod linux {
                 // written shortly after startup is recovered and the trigger
                 // becomes live without a restart.
                 Ok(None) => {
-                    eprintln!(
-                        "draug: cgroup reports no memory limit at startup; \
-                         the --mem-threshold trigger cannot fire yet and will \
-                         activate if a real limit appears (recovery is retried \
-                         each tick)"
+                    logger.log(
+                        LogLevel::Warn,
+                        "event=mem-limit-unavailable detail=\"cgroup reports no \
+                         memory limit at startup; --mem-threshold cannot fire \
+                         until a limit appears (retried each tick)\"",
                     );
                     None
                 }
@@ -282,11 +286,13 @@ mod linux {
                 // becomes readable later is recovered without a restart.
                 Err(e) => {
                     if has_threshold {
-                        eprintln!(
-                            "draug: could not read the cgroup memory limit at startup \
-                             ({e}); the --mem-threshold trigger cannot fire yet and \
-                             will activate if the limit becomes readable (recovery \
-                             is retried each tick)"
+                        logger.log(
+                            LogLevel::Warn,
+                            &format!(
+                                "event=mem-limit-unreadable error={e:?} \
+                                 detail=\"--mem-threshold cannot fire until the \
+                                 limit becomes readable (retried each tick)\""
+                            ),
                         );
                     }
                     None
@@ -324,10 +330,14 @@ mod linux {
         let mut child = match spawn(&config) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("draug: initial spawn failed: {e}");
+                logger.log(
+                    LogLevel::Error,
+                    &format!("event=spawn-failed phase=initial error={e:?}"),
+                );
                 return 1;
             }
         };
+        log_spawned(&logger, &config, child.pid().as_raw());
         let mut spawn_instant = Instant::now();
         // Edge-triggered latch for the "heartbeat unreadable" WARNING. Set when
         // the heartbeat first becomes unreadable so we log once per unreadable
@@ -363,7 +373,7 @@ mod linux {
                 Ok(n) => n,
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
-                    eprintln!("draug: epoll wait error: {e}");
+                    logger.log(LogLevel::Error, &format!("event=epoll-error error={e:?}"));
                     return 1;
                 }
             };
@@ -374,7 +384,7 @@ mod linux {
             // coincident with a PSI edge is accounted as a crash, never
             // mislabeled as a graceful PSI restart. This unifies the old SIGCHLD
             // fast-path and the tick backstop into one rule.
-            if state_implies_live_child(state) && reap(&mut child) == ReapOutcome::Exited {
+            if state_implies_live_child(state) && reap(&logger, &mut child) == ReapOutcome::Exited {
                 pending.push_back(fsm::Event::ChildExited);
             }
 
@@ -403,7 +413,13 @@ mod linux {
                             || cgroup::read_memory_max(&cg),
                             has_threshold,
                         );
-                        maybe_reopen_psi(&mut psi_handle, &mut psi_reopen_left, &epoll, &config);
+                        maybe_reopen_psi(
+                            &logger,
+                            &mut psi_handle,
+                            &mut psi_reopen_left,
+                            &epoll,
+                            &config,
+                        );
                         pending.push_back(fsm::Event::Tick);
                     }
                     TOK_ACTION => {
@@ -418,8 +434,9 @@ mod linux {
                             if let PsiHandle::Event(fd) = &psi_handle {
                                 let _ = epoll.delete(fd.as_fd());
                             }
-                            eprintln!(
-                                "draug: PSI trigger fd error/hangup; disabling the PSI trigger"
+                            logger.log(
+                                LogLevel::Warn,
+                                "event=psi-disabled reason=fd-error-or-hangup",
                             );
                             psi_handle = PsiHandle::Unavailable;
                             // A runtime HUP is not a startup race; never retry it
@@ -441,6 +458,7 @@ mod linux {
                 // does no per-event I/O (#9).
                 let samples = if matches!(state, fsm::State::Running) {
                     build_samples(
+                        &logger,
                         &cg,
                         cached_mem_max,
                         &config,
@@ -459,10 +477,14 @@ mod linux {
                             Ok(c) => {
                                 child = c;
                                 spawn_instant = Instant::now();
+                                log_spawned(&logger, &config, child.pid().as_raw());
                                 pending.push_back(fsm::Event::SpawnResult(fsm::SpawnOutcome::Ok));
                             }
                             Err(e) => {
-                                eprintln!("draug: respawn failed: {e}");
+                                logger.log(
+                                    LogLevel::Error,
+                                    &format!("event=spawn-failed phase=respawn error={e:?}"),
+                                );
                                 pending.push_back(fsm::Event::SpawnResult(fsm::SpawnOutcome::Err));
                             }
                         },
@@ -514,18 +536,28 @@ mod linux {
                                     // compiled out, so surface the broken
                                     // invariant instead of silently dropping an
                                     // anomaly alert.
-                                    eprintln!(
-                                        "draug: internal error: drain alert \
-                                         (reason={reason:?} escalated={escalated}) had no \
-                                         captured snapshot; alert dropped"
+                                    logger.log(
+                                        LogLevel::Error,
+                                        &format!(
+                                            "event=internal detail=\"drain alert had no \
+                                             captured snapshot; alert dropped\" \
+                                             reason={reason:?} escalated={escalated}"
+                                        ),
                                     );
                                 }
                             } else {
-                                log_restart(reason, escalated);
+                                log_restart(
+                                    &logger,
+                                    &config,
+                                    child.pid().as_raw(),
+                                    reason,
+                                    escalated,
+                                    ctx.restart_total,
+                                );
                             }
                         }
                         fsm::Action::LogCrash { healthy, lived } => {
-                            log_crash(healthy, lived);
+                            log_crash(&logger, &config, child.pid().as_raw(), healthy, lived);
                         }
                         fsm::Action::CrashLoopGiveUp {
                             failures,
@@ -536,9 +568,21 @@ mod linux {
                                 &cg,
                                 cached_mem_max,
                                 &config,
-                                failures,
                                 restart_count,
                                 &child,
+                            );
+                            // Log the give-up with the SAME counters the snapshot
+                            // carried, so stderr and the webhook cannot disagree.
+                            let label =
+                                target_label(&config.target, config.heartbeat_file.as_deref());
+                            logger.log(
+                                LogLevel::Error,
+                                &crash_loop_message(
+                                    &label,
+                                    child.pid().as_raw(),
+                                    failures,
+                                    restart_count,
+                                ),
                             );
                         }
                         fsm::Action::Unkillable { reason } => {
@@ -559,10 +603,14 @@ mod linux {
                                     sink.send(&snap, sev);
                                 }
                             }
-                            eprintln!(
-                                "draug: target survived SIGKILL within {:?}; exiting \
-                                 non-zero so tini tears down the container",
-                                fsm::KILL_CONFIRM
+                            logger.log(
+                                LogLevel::Error,
+                                &format!(
+                                    "event=unkillable detail=\"target survived SIGKILL \
+                                     within {:?}; exiting non-zero so tini tears down \
+                                     the container\"",
+                                    fsm::KILL_CONFIRM
+                                ),
                             );
                         }
                         fsm::Action::Exit(code) => return code,
@@ -622,6 +670,7 @@ mod linux {
     /// Consumes one budget unit per real attempt; on success registers the fd,
     /// swaps the handle, logs once, and zeroes the budget (no further attempts).
     fn maybe_reopen_psi(
+        logger: &Logger,
         psi_handle: &mut PsiHandle,
         psi_reopen_left: &mut u32,
         epoll: &Epoll,
@@ -638,7 +687,7 @@ mod linux {
         if let PsiHandle::Event(fd) = &reopened {
             match epoll.add(fd.as_fd(), EpollEvent::new(EpollFlags::EPOLLPRI, TOK_PSI)) {
                 Ok(()) => {
-                    eprintln!("draug: PSI trigger became available; event mode active");
+                    logger.log(LogLevel::Info, "event=psi-active detail=\"event mode\"");
                     *psi_handle = reopened;
                     *psi_reopen_left = 0;
                 }
@@ -647,9 +696,12 @@ mod linux {
                     // until the budget runs out. Log the failure so a PSI trigger
                     // that opens but never registers is diagnosable instead of
                     // silently staying disabled for the process lifetime (#5).
-                    eprintln!(
-                        "draug: PSI trigger reopened but epoll registration failed \
-                         ({e}); will retry"
+                    logger.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "event=psi-reopen-failed error={e:?} \
+                             detail=\"reopened but epoll registration failed; will retry\""
+                        ),
                     );
                 }
             }
@@ -660,6 +712,7 @@ mod linux {
 
     /// Build the FSM's `Samples` for one step from the existing `sample` leaf.
     fn build_samples(
+        logger: &Logger,
         cg: &cgroup::CgroupPaths,
         cached_mem_max: Option<u64>,
         config: &Config,
@@ -668,6 +721,7 @@ mod linux {
         heartbeat_unreadable_warned: &mut bool,
     ) -> fsm::Samples {
         let i = sample(
+            logger,
             cg,
             cached_mem_max,
             config,
@@ -747,6 +801,7 @@ mod linux {
     ///   `Inconclusive` lets the caller act defensively without committing to
     ///   either.
     fn reap_with_retry(
+        logger: &Logger,
         mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
         cap: u32,
     ) -> ReapOutcome {
@@ -770,7 +825,7 @@ mod linux {
                     // a real crash (#4). The reap-first caller acts only on a
                     // confirmed `Exited`, so an `Inconclusive` is simply retried
                     // on the next wakeup's reap. Log once.
-                    eprintln!("draug: reap error: {e}");
+                    logger.log(LogLevel::Warn, &format!("event=reap-error error={e:?}"));
                     return ReapOutcome::Inconclusive;
                 }
             }
@@ -778,23 +833,26 @@ mod linux {
         // Interrupted past the cap: do NOT fabricate an exit and do NOT fake a
         // confirmed-running result — report `Inconclusive`. A pathological signal
         // storm is the only way to get here; make the give-up visible.
-        eprintln!("draug: reap interrupted past retry cap; outcome inconclusive");
+        logger.log(
+            LogLevel::Warn,
+            "event=reap-inconclusive detail=\"interrupted past retry cap\"",
+        );
         ReapOutcome::Inconclusive
     }
 
-    fn reap(child: &mut Child) -> ReapOutcome {
-        reap_with_retry(|| child::try_reap(child), REAP_EINTR_RETRIES)
+    fn reap(logger: &Logger, child: &mut Child) -> ReapOutcome {
+        reap_with_retry(logger, || child::try_reap(child), REAP_EINTR_RETRIES)
     }
 
-    /// The crash-loop give-up log line. Quotes BOTH counters so the stderr log
+    /// The crash-loop give-up log body. Quotes BOTH counters so the stderr log
     /// can never contradict the webhook: `failures` is the consecutive-crash
     /// streak that tripped `max_failures`, while `restart_total` is the lifetime
     /// number of restarts COMPLETED before giving up (the SAME value carried by
     /// the crash-loop alert's snapshot).
-    fn crash_loop_message(failures: u32, restart_total: u64) -> String {
+    fn crash_loop_message(label: &str, pid: i32, failures: u32, restart_total: u64) -> String {
         format!(
-            "draug: crash-loop: {failures} consecutive failures, \
-             {restart_total} lifetime restart(s); exiting"
+            "event=crash-loop {label} pid={pid} failures={failures} \
+             restarts={restart_total} action=giving-up"
         )
     }
 
@@ -803,7 +861,6 @@ mod linux {
         cg: &cgroup::CgroupPaths,
         cached_mem_max: Option<u64>,
         config: &Config,
-        failures: u32,
         restart_total: u64,
         child: &Child,
     ) {
@@ -825,8 +882,8 @@ mod linux {
         if let Some(sev) = alert::classify(RestartReason::Crash, false, true) {
             sink.send(&snap, sev);
         }
-        // Quote BOTH counters so stderr and the webhook agree for this event.
-        eprintln!("{}", crash_loop_message(failures, restart_total));
+        // The adjacent stderr give-up line is emitted by the caller with these
+        // same `failures`/`restart_total` counters, so the two cannot disagree.
     }
 
     /// Recover an initially-missing cgroup memory limit on the live decision
@@ -894,6 +951,7 @@ mod linux {
     }
 
     fn sample(
+        logger: &Logger,
         cg: &cgroup::CgroupPaths,
         cached_mem_max: Option<u64>,
         config: &Config,
@@ -925,11 +983,14 @@ mod linux {
                     // every tick. The latch is reset whenever the file becomes
                     // readable/missing again so a recurrence is re-logged.
                     if !*heartbeat_unreadable_warned {
-                        eprintln!(
-                            "draug: heartbeat file {} exists but is unreadable; \
-                             treating as no signal (NOT restarting). Check \
-                             permissions/ownership.",
-                            p.display()
+                        logger.log(
+                            LogLevel::Warn,
+                            &format!(
+                                "event=heartbeat-unreadable heartbeat={} \
+                                 detail=\"exists but unreadable; treating as no \
+                                 signal (NOT restarting); check permissions/ownership\"",
+                                logfmt_value(&p.display().to_string())
+                            ),
                         );
                         *heartbeat_unreadable_warned = true;
                     }
@@ -993,11 +1054,84 @@ mod linux {
         }
     }
 
-    fn log_restart(reason: RestartReason, escalated: bool) {
-        eprintln!("draug: restart reason={reason:?} escalated={escalated}");
+    /// Concise identity of the supervised target for log correlation: the
+    /// command line (argv joined by spaces) and the heartbeat file draug
+    /// watches. Without it, a host running several draug-supervised targets side
+    /// by side (two different programs, or N replicas of one) emits
+    /// indistinguishable restart lines, so an operator cannot tell WHICH target
+    /// is flapping. Takes the two fields rather than `&Config` so it stays a
+    /// pure, table-testable formatter. `heartbeat=none` when no heartbeat file
+    /// is configured.
+    fn target_label(target: &[String], heartbeat_file: Option<&std::path::Path>) -> String {
+        let cmd = target.join(" ");
+        match heartbeat_file {
+            Some(p) => format!(
+                "target={cmd:?} heartbeat={}",
+                logfmt_value(&p.display().to_string())
+            ),
+            None => format!("target={cmd:?} heartbeat=none"),
+        }
     }
-    fn log_crash(healthy: bool, lived: Duration) {
-        eprintln!("draug: target crashed healthy={healthy} lived={:?}", lived);
+
+    /// Render a logfmt value, quoting it (Rust-debug-escaped) only when it
+    /// contains whitespace or a logfmt delimiter, so a heartbeat path with a
+    /// space cannot break the `key=value` framing a collector relies on. Values
+    /// with no special chars stay bare for readability (the common case). The
+    /// target argv is always rendered with `{:?}` because a command line almost
+    /// always has spaces; this helper covers the path field.
+    fn logfmt_value(s: &str) -> String {
+        if s.is_empty() || s.contains([' ', '\t', '\n', '"', '=']) {
+            format!("{s:?}")
+        } else {
+            s.to_string()
+        }
+    }
+
+    fn spawned_message(label: &str, pid: i32) -> String {
+        format!("event=spawned {label} pid={pid}")
+    }
+
+    /// `restarts` is the lifetime number of restarts COMPLETED before this one
+    /// (a monotonic counter), matching the field's meaning in the crash-loop
+    /// line; `pid` is the outgoing child being restarted.
+    fn restart_message(
+        label: &str,
+        pid: i32,
+        reason: RestartReason,
+        escalated: bool,
+        restarts: u64,
+    ) -> String {
+        format!(
+            "event=restart {label} pid={pid} reason={reason:?} \
+             escalated={escalated} restarts={restarts}"
+        )
+    }
+
+    fn crash_message(label: &str, pid: i32, healthy: bool, lived: Duration) -> String {
+        format!("event=crash {label} pid={pid} healthy={healthy} lived={lived:?}")
+    }
+
+    fn log_spawned(logger: &Logger, config: &Config, pid: i32) {
+        let label = target_label(&config.target, config.heartbeat_file.as_deref());
+        logger.log(LogLevel::Info, &spawned_message(&label, pid));
+    }
+    fn log_restart(
+        logger: &Logger,
+        config: &Config,
+        pid: i32,
+        reason: RestartReason,
+        escalated: bool,
+        restarts: u64,
+    ) {
+        let label = target_label(&config.target, config.heartbeat_file.as_deref());
+        logger.log(
+            LogLevel::Warn,
+            &restart_message(&label, pid, reason, escalated, restarts),
+        );
+    }
+    fn log_crash(logger: &Logger, config: &Config, pid: i32, healthy: bool, lived: Duration) {
+        let label = target_label(&config.target, config.heartbeat_file.as_deref());
+        logger.log(LogLevel::Warn, &crash_message(&label, pid, healthy, lived));
     }
 
     #[cfg(test)]
@@ -1007,6 +1141,14 @@ mod linux {
         use std::fs;
         use std::sync::Mutex;
         use tempfile::tempdir;
+
+        /// A `Logger` for tests: emits everything (debug threshold), no
+        /// timestamps. The helper tests assert on returned strings, not stderr,
+        /// so the sink itself is irrelevant -- this just satisfies the `&Logger`
+        /// argument the reap path now takes.
+        fn test_logger() -> Logger {
+            Logger::new(LogLevel::Debug, false)
+        }
 
         /// Build a fake cgroup v2 dir with the given `memory.max` contents and an
         /// optional `memory.current`.
@@ -1132,6 +1274,7 @@ mod linux {
         fn reap_retries_eintr_then_observes_exit() {
             let mut calls = 0;
             let got = reap_with_retry(
+                &test_logger(),
                 || {
                     calls += 1;
                     if calls == 1 {
@@ -1153,11 +1296,11 @@ mod linux {
         #[test]
         fn reap_maps_clean_exit_to_exited_code_independent() {
             assert_eq!(
-                reap_with_retry(|| Ok(Some(exited(0))), REAP_EINTR_RETRIES),
+                reap_with_retry(&test_logger(), || Ok(Some(exited(0))), REAP_EINTR_RETRIES),
                 ReapOutcome::Exited
             );
             assert_eq!(
-                reap_with_retry(|| Ok(Some(exited(137))), REAP_EINTR_RETRIES),
+                reap_with_retry(&test_logger(), || Ok(Some(exited(137))), REAP_EINTR_RETRIES),
                 ReapOutcome::Exited,
                 "the exit code is irrelevant: any Ok(Some) is Exited"
             );
@@ -1171,7 +1314,7 @@ mod linux {
         fn reap_maps_signalled_exit_to_exited() {
             use std::os::unix::process::ExitStatusExt;
             let signalled = ExitStatus::from_raw(Signal::SIGKILL as i32);
-            let got = reap_with_retry(|| Ok(Some(signalled)), REAP_EINTR_RETRIES);
+            let got = reap_with_retry(&test_logger(), || Ok(Some(signalled)), REAP_EINTR_RETRIES);
             assert_eq!(got, ReapOutcome::Exited);
         }
 
@@ -1182,6 +1325,7 @@ mod linux {
         fn reap_returns_running_immediately_when_still_running() {
             let mut calls = 0;
             let got = reap_with_retry(
+                &test_logger(),
                 || {
                     calls += 1;
                     Ok(None)
@@ -1202,6 +1346,7 @@ mod linux {
             let mut calls = 0;
             let cap = 3;
             let got = reap_with_retry(
+                &test_logger(),
                 || {
                     calls += 1;
                     Err(eintr())
@@ -1225,6 +1370,7 @@ mod linux {
         fn reap_non_eintr_error_is_inconclusive_without_retry() {
             let mut calls = 0;
             let got = reap_with_retry(
+                &test_logger(),
                 || {
                     calls += 1;
                     Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
@@ -1362,14 +1508,100 @@ mod linux {
         // reports 0 lifetime restarts.
         #[test]
         fn crash_loop_message_quotes_failures_and_lifetime_restarts() {
+            let label = "target=\"svc\" heartbeat=none";
             // Crash-looped from startup: 0 lifetime restarts.
-            let msg = crash_loop_message(3, 0);
-            assert!(msg.contains("3 consecutive failures"), "msg = {msg}");
-            assert!(msg.contains("0 lifetime restart"), "msg = {msg}");
+            let msg = crash_loop_message(label, 1234, 3, 0);
+            assert!(msg.contains("event=crash-loop"), "msg = {msg}");
+            assert!(msg.contains("failures=3"), "msg = {msg}");
+            assert!(msg.contains("restarts=0"), "msg = {msg}");
+            assert!(msg.contains("pid=1234"), "msg = {msg}");
+            assert!(msg.contains(label), "msg = {msg}");
             // The two distinct counters must both be present and distinct.
-            let msg = crash_loop_message(5, 2);
-            assert!(msg.contains("5 consecutive failures"), "msg = {msg}");
-            assert!(msg.contains("2 lifetime restart"), "msg = {msg}");
+            let msg = crash_loop_message(label, 1234, 5, 2);
+            assert!(msg.contains("failures=5"), "msg = {msg}");
+            assert!(msg.contains("restarts=2"), "msg = {msg}");
+        }
+
+        // `spawned` is the new lifecycle line that answers "what did draug just
+        // start, and as which PID" -- the field an operator needs to attribute a
+        // later restart/crash line to a specific child (and to tell apart N
+        // same-argv replicas, where the pid is the only unique key).
+        #[test]
+        fn spawned_message_carries_label_and_pid() {
+            let label = "target=\"sleep 30\" heartbeat=/run/draug/hb";
+            let m = spawned_message(label, 4321);
+            assert!(m.contains("event=spawned"), "msg = {m}");
+            assert!(m.contains(label), "msg = {m}");
+            assert!(m.contains("pid=4321"), "msg = {m}");
+        }
+
+        // The lifecycle log lines must carry the target's identity (argv +
+        // heartbeat path) so an operator triaging a host with several
+        // draug-supervised targets can tell WHICH one is flapping. Before this,
+        // every restart line read `draug: restart reason=... escalated=...` with
+        // no way to attribute it.
+        #[test]
+        fn target_label_includes_argv_and_heartbeat_path() {
+            use std::path::Path;
+            let argv = ["sleep".to_string(), "30".to_string()];
+            let with_hb = target_label(&argv, Some(Path::new("/run/draug/a.hb")));
+            assert!(with_hb.contains("sleep 30"), "label = {with_hb}");
+            assert!(
+                with_hb.contains("heartbeat=/run/draug/a.hb"),
+                "label = {with_hb}"
+            );
+            // Two targets differing only by heartbeat path stay distinguishable.
+            let other = target_label(&argv, Some(Path::new("/run/draug/b.hb")));
+            assert_ne!(with_hb, other);
+            // No heartbeat configured => explicit `none`, never an empty value.
+            let no_hb = target_label(&argv, None);
+            assert!(no_hb.contains("heartbeat=none"), "label = {no_hb}");
+        }
+
+        // A heartbeat path containing whitespace must NOT break the logfmt
+        // framing: it has to be quoted so a collector still parses `heartbeat`
+        // as one value. A path with no special chars stays bare for readability.
+        #[test]
+        fn logfmt_value_quotes_only_when_needed() {
+            // Bare for the common case.
+            assert_eq!(logfmt_value("/run/draug/hb"), "/run/draug/hb");
+            // Quoted (and escaped) when whitespace or a delimiter is present.
+            assert_eq!(logfmt_value("/run/my dir/hb"), "\"/run/my dir/hb\"");
+            assert_eq!(logfmt_value("a=b"), "\"a=b\"");
+            assert!(logfmt_value("a\"b").starts_with('"'));
+            assert!(logfmt_value("a\nb").starts_with('"'));
+            assert_eq!(logfmt_value(""), "\"\"");
+        }
+
+        #[test]
+        fn target_label_quotes_a_spaced_heartbeat_path() {
+            use std::path::Path;
+            let argv = ["sleep".to_string(), "30".to_string()];
+            let label = target_label(&argv, Some(Path::new("/run/my dir/hb")));
+            // The spaced path is quoted, so `heartbeat=` stays a single value and
+            // the line does not split into a stray bare token.
+            assert!(
+                label.contains("heartbeat=\"/run/my dir/hb\""),
+                "label = {label}"
+            );
+        }
+
+        #[test]
+        fn restart_and_crash_messages_carry_label_pid_and_fields() {
+            let label = "target=\"sleep 30\" heartbeat=/run/draug/hb";
+            let r = restart_message(label, 1234, RestartReason::HeartbeatStale, false, 3);
+            assert!(r.contains("event=restart"), "msg = {r}");
+            assert!(r.contains(label), "msg = {r}");
+            assert!(r.contains("pid=1234"), "msg = {r}");
+            assert!(r.contains("reason=HeartbeatStale"), "msg = {r}");
+            assert!(r.contains("escalated=false"), "msg = {r}");
+            assert!(r.contains("restarts=3"), "msg = {r}");
+
+            let c = crash_message(label, 1234, true, Duration::from_secs(7));
+            assert!(c.contains("event=crash"), "msg = {c}");
+            assert!(c.contains(label), "msg = {c}");
+            assert!(c.contains("pid=1234"), "msg = {c}");
+            assert!(c.contains("healthy=true"), "msg = {c}");
         }
 
         // Finding #5 (actual invariant): the `Snapshot` the crash-loop give-up
@@ -1392,7 +1624,7 @@ mod linux {
 
             // A target that has been restarted twice before crash-looping.
             let restart_total = 2u64;
-            crash_loop_exit(&sink, &cg, None, &config, 3, restart_total, &child);
+            crash_loop_exit(&sink, &cg, None, &config, restart_total, &child);
             kill_and_reap(&child);
 
             let sent = sink.sent.lock().unwrap();
@@ -1411,8 +1643,10 @@ mod linux {
                 "crash-loop snapshot must NOT use the +1 pending count"
             );
             // The adjacent stderr log quotes the SAME number.
+            let label = target_label(&config.target, config.heartbeat_file.as_deref());
             assert!(
-                crash_loop_message(3, restart_total).contains("2 lifetime restart"),
+                crash_loop_message(&label, child.pid().as_raw(), 3, restart_total)
+                    .contains("restarts=2"),
                 "log must quote the same lifetime restart count as the snapshot"
             );
         }

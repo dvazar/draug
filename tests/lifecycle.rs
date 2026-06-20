@@ -25,7 +25,7 @@
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // Single-sourced integration webhook mock (its reader + a `Connection: close`
@@ -351,6 +351,74 @@ fn periodic_restart_happy_path() {
         mock.count_field_eq("severity", "critical".into()),
         0,
         "periodic restarts must not alert critical"
+    );
+}
+
+// 7) OBSERVABILITY: the structured `event=spawned` line carries the child's
+// pid, and the `--log-level` threshold actually gates emission end-to-end --
+// `info` shows `spawned`, `warn` suppresses it while still emitting `restart`.
+// Without a pid an operator cannot attribute later restart/crash lines to a
+// specific child (or tell apart N same-argv replicas); without working gating
+// the `level=` field would be inert decoration.
+#[test]
+fn spawned_line_carries_pid_and_log_level_gates_it() {
+    // Run draug at `level`, capturing its stderr to a FILE (not a pipe: the
+    // target grandchild inherits draug's stderr, so a pipe would never reach
+    // EOF after draug dies and the reader would deadlock -- a regular file does
+    // not block). Drive at least one periodic restart, then SIGTERM draug for a
+    // graceful exit that also stops the target, and return the captured stderr.
+    fn run_capture(level: &str, mark: &Path, errfile: &Path) -> String {
+        let f = std::fs::File::create(errfile).unwrap();
+        let mut child = Command::new(DRAUG)
+            .args([
+                "--restart-interval",
+                "1s",
+                "--grace-period",
+                "3s",
+                "--startup-grace",
+                "200ms",
+                "--mem-threshold",
+                "0",
+                "--psi-trigger",
+                "",
+                "--log-level",
+                level,
+            ])
+            .arg("--")
+            .args([FAKE, "--mark", mark.to_str().unwrap()])
+            .stderr(Stdio::from(f))
+            .spawn()
+            .unwrap();
+        // >=2 marks => an initial spawn and a respawn, so both a `spawned` and a
+        // `restart` line have been emitted before we stop draug.
+        assert!(
+            wait_until(Duration::from_secs(8), || line_count(mark) >= 2),
+            "expected a respawn so spawned/restart lines exist"
+        );
+        unsafe { libc_kill(child.id() as i32, 15) }; // graceful: also stops target
+        wait_with_timeout(&mut child, Duration::from_secs(6));
+        std::fs::read_to_string(errfile).unwrap_or_default()
+    }
+
+    let info = run_capture("info", &tmp("obs-info-mark"), &tmp("obs-info-err"));
+    assert!(
+        info.contains("event=spawned"),
+        "info must log spawned: {info}"
+    );
+    assert!(info.contains("pid="), "spawned must carry a pid: {info}");
+    assert!(
+        info.contains("level=info"),
+        "lines carry a level field: {info}"
+    );
+
+    let warn = run_capture("warn", &tmp("obs-warn-mark"), &tmp("obs-warn-err"));
+    assert!(
+        !warn.contains("event=spawned"),
+        "warn must suppress the info-level spawned line: {warn}"
+    );
+    assert!(
+        warn.contains("event=restart"),
+        "warn must still emit the restart line: {warn}"
     );
 }
 
