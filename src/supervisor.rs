@@ -1129,6 +1129,13 @@ mod linux {
         format!("event=crash {label} pid={pid} healthy={healthy} lived={lived:?}")
     }
 
+    /// A graceful operator/orchestrator stop (SIGTERM/SIGINT): the child is
+    /// drained and the supervisor exits. Distinct from `event=restart` so a
+    /// deploy-time drain is not mistaken for a periodic recycle or a crash.
+    fn shutdown_message(label: &str, pid: i32, escalated: bool) -> String {
+        format!("event=shutdown {label} pid={pid} escalated={escalated}")
+    }
+
     fn log_spawned(logger: &Logger, config: &Config, pid: i32) {
         let label = target_label(&config.target, config.heartbeat_file.as_deref());
         logger.log(LogLevel::Info, &spawned_message(&label, pid));
@@ -1142,6 +1149,18 @@ mod linux {
         restarts: u64,
     ) {
         let label = target_label(&config.target, config.heartbeat_file.as_deref());
+        // A graceful operator/orchestrator stop is not a restart: log it as
+        // `event=shutdown` (info, or warn if the child had to be SIGKILLed) so a
+        // deploy-time drain doesn't masquerade as a periodic recycle.
+        if reason == RestartReason::Shutdown {
+            let level = if escalated {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            };
+            logger.log(level, &shutdown_message(&label, pid, escalated));
+            return;
+        }
         logger.log(
             LogLevel::Warn,
             &restart_message(&label, pid, reason, escalated, restarts),
@@ -1620,6 +1639,27 @@ mod linux {
             assert!(c.contains(label), "msg = {c}");
             assert!(c.contains("pid=1234"), "msg = {c}");
             assert!(c.contains("healthy=true"), "msg = {c}");
+        }
+
+        // A graceful operator/orchestrator stop must read as `event=shutdown`,
+        // NOT as a restart/recycle: this is the regression that made a
+        // deploy-time SIGTERM drain look like `reason=Periodic` in the logs.
+        #[test]
+        fn shutdown_message_is_distinct_from_restart() {
+            let label = "target=\"sleep 30\" heartbeat=/run/draug/hb";
+            let s = shutdown_message(label, 1234, false);
+            assert!(s.contains("event=shutdown"), "msg = {s}");
+            assert!(s.contains(label), "msg = {s}");
+            assert!(s.contains("pid=1234"), "msg = {s}");
+            assert!(s.contains("escalated=false"), "msg = {s}");
+            // No restart/recycle fields leak into a shutdown line.
+            assert!(!s.contains("event=restart"), "msg = {s}");
+            assert!(!s.contains("reason="), "msg = {s}");
+            assert!(!s.contains("restarts="), "msg = {s}");
+            // An escalated drain (child SIGKILLed) keeps the event, flags it.
+            let esc = shutdown_message(label, 1234, true);
+            assert!(esc.contains("event=shutdown"), "msg = {esc}");
+            assert!(esc.contains("escalated=true"), "msg = {esc}");
         }
 
         // Finding #5 (actual invariant): the `Snapshot` the crash-loop give-up

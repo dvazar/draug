@@ -51,7 +51,10 @@ pub fn classify(reason: RestartReason, escalated: bool, crash_loop: bool) -> Opt
     }
     match reason {
         RestartReason::Memory | RestartReason::Psi => Some(Severity::Warning),
-        RestartReason::Periodic | RestartReason::HeartbeatStale | RestartReason::Crash => None,
+        RestartReason::Periodic
+        | RestartReason::HeartbeatStale
+        | RestartReason::Crash
+        | RestartReason::Shutdown => None,
     }
 }
 
