@@ -23,6 +23,7 @@ pub mod diagnostics;
 pub mod fsm;
 pub mod heartbeat;
 pub mod log;
+pub mod procfs;
 pub mod psi;
 pub mod supervisor;
 
