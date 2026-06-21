@@ -58,6 +58,7 @@ mod linux {
     use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
     use std::collections::VecDeque;
     use std::os::fd::AsFd;
+    use std::path::Path;
     use std::process::ExitStatus;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -213,9 +214,23 @@ mod linux {
         let action =
             TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::TFD_NONBLOCK).expect("action");
 
+        // 4a) cgroup paths resolved authoritatively from /proc; PSI and the
+        // memory limit read below both depend on the resolved directories.
+        let cg =
+            cgroup::CgroupPaths::resolve(&config.cgroup_root, &crate::procfs::ProcSource::system());
+        logger.log(
+            LogLevel::Info,
+            &format!(
+                "event=cgroup-resolved version={:?} memory_dir={} cpu_dir={}",
+                cg.version,
+                logfmt_value(&cg.memory_dir.display().to_string()),
+                logfmt_value(&cg.cpu_dir.display().to_string()),
+            ),
+        );
+
         // 4) PSI (optional).
         let mut psi_handle = match &config.psi_trigger {
-            Some(t) => psi::open(&config.cgroup_root, t),
+            Some(t) => psi::open(&cg.memory_dir, t),
             None => PsiHandle::Unavailable,
         };
         // Budget for upgrading PSI to event mode after a startup race (#3): when
@@ -231,7 +246,7 @@ mod linux {
         let mut psi_reopen_left: u32 =
             initial_psi_reopen_budget(config.psi_trigger.is_some(), &psi_handle);
 
-        // 5) cgroup paths + the memory limit read at startup. We treat a
+        // 5) the memory limit read at startup. We treat a
         // KNOWN limit as fixed for this process's lifetime — true for typical
         // container runtimes; an in-place resize of an already-known limit is
         // NOT observed until restart. Caching it avoids re-reading and
@@ -242,7 +257,6 @@ mod linux {
         // re-reads while the cache is still `None` and a threshold is set, and
         // caches the first real value it sees (see `refresh_mem_limit`). Once a
         // real limit is cached we stop re-reading.
-        let cg = cgroup::CgroupPaths::resolve(&config.cgroup_root);
         // When a threshold is configured the operator expects a real limit, so
         // retry both a genuine read failure (cgroupfs may not be fully mounted
         // yet during container init) AND an `Ok(None)` (cgroup v2 `memory.max`
@@ -290,8 +304,10 @@ mod linux {
                             LogLevel::Warn,
                             &format!(
                                 "event=mem-limit-unreadable error={e:?} \
-                                 detail=\"--mem-threshold cannot fire until the \
-                                 limit becomes readable (retried each tick)\""
+                                 path={} detail=\"--mem-threshold cannot fire \
+                                 until the limit becomes readable (retried each \
+                                 tick)\"",
+                                logfmt_value(&cg.memory_dir.display().to_string())
                             ),
                         );
                     }
@@ -419,6 +435,7 @@ mod linux {
                             &mut psi_reopen_left,
                             &epoll,
                             &config,
+                            &cg.memory_dir,
                         );
                         pending.push_back(fsm::Event::Tick);
                     }
@@ -675,6 +692,7 @@ mod linux {
         psi_reopen_left: &mut u32,
         epoll: &Epoll,
         config: &Config,
+        psi_dir: &Path,
     ) {
         let Some(trigger) = &config.psi_trigger else {
             return;
@@ -683,7 +701,7 @@ mod linux {
             return;
         }
         *psi_reopen_left -= 1;
-        let reopened = psi::open(&config.cgroup_root, trigger);
+        let reopened = psi::open(psi_dir, trigger);
         if let PsiHandle::Event(fd) = &reopened {
             match epoll.add(fd.as_fd(), EpollEvent::new(EpollFlags::EPOLLPRI, TOK_PSI)) {
                 Ok(()) => {
@@ -1217,7 +1235,7 @@ mod linux {
         #[test]
         fn retry_on_persistent_none_when_threshold_configured() {
             let d = fake_cgroup_v2("max", Some("100"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             // 1 attempt to keep the test fast: the point is that `Ok(None)` is
             // returned (not an early-accepted unlimited), so the caller warns.
             let got = read_mem_max_with_retry(&cg, 1, true);
@@ -1229,7 +1247,7 @@ mod linux {
         #[test]
         fn finite_limit_returned_with_retry_on_none() {
             let d = fake_cgroup_v2("4096", Some("100"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             assert_eq!(read_mem_max_with_retry(&cg, 3, true).unwrap(), Some(4096));
         }
 
@@ -1239,7 +1257,7 @@ mod linux {
         #[test]
         fn none_accepted_at_once_without_threshold() {
             let d = fake_cgroup_v2("max", Some("100"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             assert_eq!(read_mem_max_with_retry(&cg, 1, false).unwrap(), None);
         }
 
@@ -1250,7 +1268,7 @@ mod linux {
             let d = tempdir().unwrap();
             fs::write(d.path().join("cgroup.controllers"), "memory\n").unwrap();
             // no memory.max file => read error
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             assert!(read_mem_max_with_retry(&cg, 1, true).is_err());
         }
 
@@ -1387,7 +1405,7 @@ mod linux {
         #[test]
         fn mem_sample_recovers_limit_when_cache_none() {
             let d = fake_cgroup_v2("1000", Some("850"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             let s = mem_sample(&cg, None, true).expect("current readable");
             assert_eq!(s.current, 850);
             assert_eq!(s.max, Some(1000));
@@ -1400,7 +1418,7 @@ mod linux {
         #[test]
         fn mem_sample_keeps_cache_none_on_hot_path() {
             let d = fake_cgroup_v2("1000", Some("850"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             let s = mem_sample(&cg, None, false).expect("current readable");
             assert_eq!(s.current, 850);
             assert_eq!(s.max, None);
@@ -1412,7 +1430,7 @@ mod linux {
         #[test]
         fn mem_sample_uses_cached_limit_verbatim() {
             let d = fake_cgroup_v2("max", Some("256"));
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             // cache says 512; the file says "max" (None) — cache must win, and
             // recovery must not even run because the cache is already Some.
             let s = mem_sample(&cg, Some(512), true).expect("current readable");
@@ -1425,7 +1443,7 @@ mod linux {
         #[test]
         fn mem_sample_none_when_current_unreadable() {
             let d = fake_cgroup_v2("1000", None);
-            let cg = cgroup::CgroupPaths::resolve(d.path());
+            let cg = cgroup::CgroupPaths::flat(d.path());
             assert!(mem_sample(&cg, Some(1000), false).is_none());
         }
 
@@ -1617,7 +1635,7 @@ mod linux {
         #[test]
         fn crash_loop_snapshot_count_matches_log_lifetime_restarts() {
             let cgdir = fake_cgroup_v2("1000", Some("100"));
-            let cg = cgroup::CgroupPaths::resolve(cgdir.path());
+            let cg = cgroup::CgroupPaths::flat(cgdir.path());
             let config = test_config(cgdir.path());
             let child = spawn_sleeper();
             let sink = RecordingSink::default();
