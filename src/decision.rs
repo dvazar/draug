@@ -14,7 +14,8 @@
 
 use std::time::Duration;
 
-/// Why the supervisor is restarting the target.
+/// Why the supervisor is restarting -- or, for `Shutdown`, gracefully stopping
+/// -- the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartReason {
     Periodic,
@@ -22,6 +23,9 @@ pub enum RestartReason {
     Psi,
     HeartbeatStale,
     Crash,
+    /// Operator/orchestrator-initiated graceful stop (SIGTERM/SIGINT): the child
+    /// is drained and the supervisor exits without respawning. Not an anomaly.
+    Shutdown,
 }
 
 /// Outcome of evaluating the triggers.

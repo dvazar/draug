@@ -237,7 +237,7 @@ pub fn step(state: State, ctx: &mut Ctx, event: Event, samples: &Samples) -> (St
     match state {
         State::Running => match event {
             Event::ChildExited => handle_crash(ctx, samples.elapsed),
-            Event::OperatorStop => begin_drain(RestartReason::Periodic, true, ctx),
+            Event::OperatorStop => begin_drain(RestartReason::Shutdown, true, ctx),
             Event::Tick | Event::PsiEdge => {
                 if matches!(event, Event::Tick) && samples.elapsed >= ctx.startup_grace {
                     ctx.failures = 0;
@@ -342,7 +342,7 @@ pub fn step(state: State, ctx: &mut Ctx, event: Event, samples: &Samples) -> (St
                     // so honor the stop by draining it for shutdown rather than
                     // dropping the SIGTERM and returning to Running (#2). Reuses
                     // the same shutdown-drain path as Running + OperatorStop.
-                    begin_drain(RestartReason::Periodic, true, ctx)
+                    begin_drain(RestartReason::Shutdown, true, ctx)
                 } else {
                     (State::Running, Vec::new())
                 }
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(
             st,
             State::Draining {
-                reason: RestartReason::Periodic,
+                reason: RestartReason::Shutdown,
                 shutdown: true
             }
         );
@@ -615,7 +615,7 @@ mod tests {
     fn draining_clean_exit_shutdown_exits_zero() {
         let mut c = ctx();
         let st0 = State::Draining {
-            reason: RestartReason::Periodic,
+            reason: RestartReason::Shutdown,
             shutdown: true,
         };
         let (_, acts) = step(st0, &mut c, Event::ChildExited, &samples(100));
@@ -1167,7 +1167,7 @@ mod tests {
         assert_eq!(
             st2,
             State::Draining {
-                reason: RestartReason::Periodic,
+                reason: RestartReason::Shutdown,
                 shutdown: true
             }
         );
